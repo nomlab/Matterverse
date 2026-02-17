@@ -1013,9 +1013,6 @@ class InteractiveSubscriptionParser:
         """
         # 生の行をバッファに追加
         self._buffer += line + "\n"
-        with open("chiptool_stream.log", "a", encoding="utf-8") as f:
-          f.write(line + "\n")
-          f.flush()
 
         # バッファサイズ制限
         if len(self._buffer) > self._max_buffer_size:
@@ -1204,7 +1201,7 @@ class InteractiveChipToolManager:
     """Interactive モードでの chip-tool 管理"""
 
     def __init__(self, chip_tool_path: str, commissioning_dir: str,
-                 paa_cert_path: str, database, data_model, debug_file: str = None):
+                 paa_cert_path: str, database, data_model):
         self.chip_tool_path = chip_tool_path
         self.commissioning_dir = commissioning_dir
         self.paa_cert_path = paa_cert_path
@@ -1222,41 +1219,25 @@ class InteractiveChipToolManager:
         self._write_lock = asyncio.Lock()
         self._notification_callback = None
 
-        # デバッグファイル出力
-        self.debug_file = debug_file or "/tmp/interactive_chip_tool_debug.log"
-        self._debug_enabled = True
-        # ファイルをクリア
-        if self._debug_enabled:
-            try:
-                with open(self.debug_file, 'w') as f:
-                    f.write(f"=== Interactive ChipTool Debug Log ===\n")
-                    f.write(f"Started at: {datetime.now().isoformat()}\n\n")
-            except Exception as e:
-                self.logger.warning(f"Failed to initialize debug file: {e}")
-                self._debug_enabled = False
-
-    def _write_debug(self, message: str):
-        """デバッグメッセージをファイルに書き込み"""
-        if not self._debug_enabled:
-            return
-        try:
-            with open(self.debug_file, 'a') as f:
-                f.write(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {message}\n")
-        except Exception as e:
-            self.logger.warning(f"Failed to write debug: {e}")
-
     async def start(self):
         """Interactive モードで chip-tool を起動"""
+        print("=== DEBUG: InteractiveChipToolManager.start() called ===", flush=True)
+
         if self._running:
             self.logger.warning("chip-tool is already running")
             return
 
         try:
-            # chip-tool を interactive モードで起動
-            # 重要: バッファリング問題を回避するための設定
-            env = os.environ.copy()
-            env['PYTHONUNBUFFERED'] = '1'  # Python のバッファリング無効化
+            # chip-tool の存在と実行権限を確認
+            if not os.path.exists(self.chip_tool_path):
+                raise FileNotFoundError(f"chip-tool not found: {self.chip_tool_path}")
 
+            if not os.access(self.chip_tool_path, os.X_OK):
+                raise PermissionError(f"chip-tool is not executable: {self.chip_tool_path}")
+
+            self.logger.info(f"chip-tool binary verified: {self.chip_tool_path}")
+
+            # 環境変数は親プロセスから継承（envパラメータを渡さない）
             cmd = [
                 self.chip_tool_path,
                 "interactive",
@@ -1272,9 +1253,39 @@ class InteractiveChipToolManager:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=os.path.dirname(self.chip_tool_path),
-                env=env,
+                cwd=self.commissioning_dir,
+                preexec_fn=None,
             )
+
+            # プロセスが起動したか確認
+            if self.process.returncode is not None:
+                raise RuntimeError(f"chip-tool process exited immediately with code {self.process.returncode}")
+
+            self.logger.info(f"chip-tool process started with PID: {self.process.pid}")
+
+            # プロセス安定待機
+            await asyncio.sleep(0.1)
+
+            if self.process.returncode is not None:
+                # プロセスが即座に終了した場合、出力を読み取る
+                try:
+                    stdout_data = await asyncio.wait_for(self.process.stdout.read(), timeout=1.0)
+                    stderr_data = await asyncio.wait_for(self.process.stderr.read(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    stdout_data = b''
+                    stderr_data = b''
+
+                stdout_text = stdout_data.decode('utf-8', errors='replace').strip()
+                stderr_text = stderr_data.decode('utf-8', errors='replace').strip()
+
+                error_msg = f"chip-tool process exited immediately with code {self.process.returncode}"
+                if stdout_text:
+                    error_msg += f"\nStdout:\n{stdout_text}"
+                if stderr_text:
+                    error_msg += f"\nStderr:\n{stderr_text}"
+
+                self.logger.error(error_msg)
+                raise RuntimeError(error_msg)
 
             self._running = True
 
@@ -1283,11 +1294,9 @@ class InteractiveChipToolManager:
 
             self.logger.info("chip-tool interactive mode started")
 
-            # プロセス起動待機
-            await asyncio.sleep(2.0)
-
         except Exception as e:
             self.logger.error(f"Failed to start chip-tool: {e}")
+            self._running = False
             raise
 
     async def stop(self):
@@ -1340,8 +1349,6 @@ class InteractiveChipToolManager:
         try:
             async with self._write_lock:
                 cmd_bytes = f"{command}\n".encode('utf-8')
-                self._write_debug(f"[SEND_CMD] Command: {command}")
-                self._write_debug(f"[SEND_CMD] Bytes: {cmd_bytes}")
                 self.process.stdin.write(cmd_bytes)
                 await self.process.stdin.drain()
 
@@ -1350,7 +1357,6 @@ class InteractiveChipToolManager:
 
         except Exception as e:
             self.logger.error(f"Failed to send command: {e}")
-            self._write_debug(f"[SEND_CMD] Error: {e}")
             return False
 
     async def _monitor_output(self):
@@ -1401,22 +1407,20 @@ class InteractiveChipToolManager:
                 if not line:
                     # ストリーム終了
                     self.logger.warning(f"{stream_name} closed")
+                    # プロセス状態を確認
+                    if self.process and self.process.returncode is not None:
+                        self.logger.error(f"Process exited with code {self.process.returncode}")
                     break
 
                 line_str = line.decode('utf-8', errors='replace').strip()
 
                 if line_str:
-                    # デバッグファイルに生ログを記録
-                    self._write_debug(f"[{stream_name}] {line_str}")
-
                     # パーサーに渡す（複数の属性レポートが返る可能性あり）
                     parsed_data_list = self.parser.parse_line(line_str)
 
                     if parsed_data_list:
-                        self._write_debug(f"[PARSED] Found {len(parsed_data_list)} attribute(s)")
                         # 複数の属性レポートを順次処理
                         for parsed_data in parsed_data_list:
-                            self._write_debug(f"[PARSED] Data: {parsed_data}")
                             await self._handle_parsed_data(parsed_data)
 
         except asyncio.CancelledError:
@@ -1433,28 +1437,22 @@ class InteractiveChipToolManager:
             attribute = parsed_data.get('attribute_name', parsed_data['attribute'])
             new_value = str(parsed_data['value'])  # Convert to string for database
 
-            self._write_debug(f"[HANDLE] NodeID={node_id}, Endpoint={endpoint}, Cluster={cluster}, Attribute={attribute}, Value={new_value}")
-
             # データベースから現在値を取得
             current_value = self.database.get_attribute_value(
                 node_id, endpoint, cluster, attribute
             )
-
-            self._write_debug(f"[DB_GET] Current value: {current_value}")
 
             # 値が変更されているか、または初回（current_value が None）の場合に更新
             should_update = (current_value is None) or (current_value != new_value)
 
             if should_update:
                 if current_value is None:
-                    self._write_debug(f"[DB_UPDATE] Initial value: {new_value}")
                     self.logger.info(
                         f"Initial attribute value: NodeID={node_id}, Endpoint={endpoint}, "
                         f"Cluster={cluster}, Attribute={attribute}, "
                         f"Value={new_value}"
                     )
                 else:
-                    self._write_debug(f"[DB_UPDATE] Changed: {current_value} -> {new_value}")
                     self.logger.info(
                         f"Attribute changed: NodeID={node_id}, Endpoint={endpoint}, "
                         f"Cluster={cluster}, Attribute={attribute}, "
@@ -1470,8 +1468,6 @@ class InteractiveChipToolManager:
                     value=new_value
                 )
 
-                self._write_debug(f"[DB_UPDATE] Success: {success}")
-
                 if not success:
                     self.logger.warning(
                         f"Failed to update attribute: NodeID={node_id}, Endpoint={endpoint}, "
@@ -1480,7 +1476,6 @@ class InteractiveChipToolManager:
                     return
 
                 if self._notification_callback:
-                    self._write_debug(f"[NOTIFY] Sending notification")
                     await self._notification_callback({
                         'node_id': node_id,
                         'endpoint': endpoint,
@@ -1489,10 +1484,6 @@ class InteractiveChipToolManager:
                         'value': new_value,
                         'old_value': current_value
                     })
-                else:
-                    self._write_debug(f"[NOTIFY] Skipped (initial value or no callback)")
-            else:
-                self._write_debug(f"[SKIP] Value unchanged: {current_value}")
 
         except Exception as e:
             self.logger.error(f"Error handling parsed data: {e}")
@@ -1571,8 +1562,6 @@ class InteractiveChipToolManager:
                 f"{node_id} "  # destination-id (node-id)
                 f"{endpoint}"  # endpoint-ids
             )
-
-            self._write_debug(f"[SUBSCRIBE] Prepared command: {command}")
 
             success = await self.send_command(command)
 

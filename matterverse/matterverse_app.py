@@ -269,8 +269,8 @@ class MatterverseApplication:
         try:
             self.logger.info("Starting Matterverse application...")
 
-            # Start chip tool
-            await self.chip_tool.start()
+            # Start chip tool (not needed for interactive mode)
+            # await self.chip_tool.start()
 
             # Start interactive subscription manager (new)
             await self.interactive_manager.start()
